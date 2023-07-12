@@ -41,6 +41,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/ocsp"
 )
 
 const (
@@ -179,13 +181,14 @@ func (c *Client) Discover(ctx context.Context) (Directory, error) {
 	c.addNonce(res.Header)
 
 	var v struct {
-		Reg       string `json:"newAccount"`
-		Authz     string `json:"newAuthz"`
-		Order     string `json:"newOrder"`
-		Revoke    string `json:"revokeCert"`
-		Nonce     string `json:"newNonce"`
-		KeyChange string `json:"keyChange"`
-		Meta      struct {
+		Reg         string `json:"newAccount"`
+		Authz       string `json:"newAuthz"`
+		Order       string `json:"newOrder"`
+		Revoke      string `json:"revokeCert"`
+		Nonce       string `json:"newNonce"`
+		KeyChange   string `json:"keyChange"`
+		RenewalInfo string `json:"renewalInfo"`
+		Meta        struct {
 			Terms        string   `json:"termsOfService"`
 			Website      string   `json:"website"`
 			CAA          []string `json:"caaIdentities"`
@@ -205,6 +208,7 @@ func (c *Client) Discover(ctx context.Context) (Directory, error) {
 		RevokeURL:               v.Revoke,
 		NonceURL:                v.Nonce,
 		KeyChangeURL:            v.KeyChange,
+		RenewalInfoURL:          v.RenewalInfo,
 		Terms:                   v.Meta.Terms,
 		Website:                 v.Meta.Website,
 		CAA:                     v.Meta.CAA,
@@ -255,6 +259,54 @@ func (c *Client) RevokeCert(ctx context.Context, key crypto.Signer, cert []byte,
 		return err
 	}
 	return c.revokeCertRFC(ctx, key, cert, reason)
+}
+
+// FetchRenewalInfo retrieves the RenewalInfo from Directory.RenewalInfoURL.
+func (c *Client) FetchRenewalInfo(ctx context.Context, leaf, issuer []byte) (*RenewalInfo, error) {
+	if _, err := c.Discover(ctx); err != nil {
+		return nil, err
+	}
+
+	parsedLeaf, err := x509.ParseCertificate(leaf)
+	if err != nil {
+		return nil, err
+	}
+	parsedIssuer, err := x509.ParseCertificate(issuer)
+	if err != nil {
+		return nil, err
+	}
+
+	renewalURL, err := c.getRenewalURL(parsedLeaf, parsedIssuer)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := c.get(ctx, renewalURL, wantStatus(http.StatusOK))
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	var info RenewalInfo
+	if err := json.NewDecoder(res.Body).Decode(&info); err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
+func (c *Client) getRenewalURL(cert, issuer *x509.Certificate) (string, error) {
+	// An OCSP request is the same a CertID object as called for in the ARI
+	// Internet-Draft.
+	options := ocsp.RequestOptions{Hash: crypto.SHA256}
+	certID, err := ocsp.CreateRequest(cert, issuer, &options)
+	if err != nil {
+		return "", err
+	}
+	url := c.dir.RenewalInfoURL
+	if !strings.HasSuffix(url, "/") {
+		url += "/"
+	}
+	return url + base64.RawURLEncoding.EncodeToString(certID), nil
 }
 
 // AcceptTOS always returns true to indicate the acceptance of a CA's Terms of Service
